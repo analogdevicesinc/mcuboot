@@ -42,6 +42,8 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.hazmat.primitives.keywrap import aes_key_wrap, aes_key_unwrap
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from intelhex import IntelHex
 
 from . import version as versmod, keys
@@ -71,6 +73,7 @@ IMAGE_F = {
         'COMPRESSED_LZMA1':      0x0000200,
         'COMPRESSED_LZMA2':      0x0000400,
         'COMPRESSED_ARM_THUMB':  0x0000800,
+        'ENCRYPTED_AESGCM256':   0x0001000, 
 }
 
 TLV_VALUES = {
@@ -96,6 +99,8 @@ TLV_VALUES = {
         'DECOMP_SHA': 0x71,
         'DECOMP_SIGNATURE': 0x72,
         'COMP_DEC_SIZE' : 0x73,
+        'AESGCM_TAG': 0x00a0,
+        'AESGCM_IV': 0x00a1,
 }
 
 TLV_SIZE = 4
@@ -470,7 +475,7 @@ class Image:
                compression_type=None, encrypt_keylen=128, clear=False,
                fixed_sig=None, pub_key=None, vector_to_sign=None,
                user_sha='auto', hmac_sha='auto', is_pure=False, keep_comp_size=False,
-               dont_encrypt=False):
+               dont_encrypt=False, aes_gcm_key=None, aes_kw_key=None):
         self.enckey = enckey
 
         # key decides on sha, then pub_key; of both are none default is used
@@ -542,15 +547,11 @@ class Image:
             for value in custom_tlvs.values():
                 protected_tlv_size += TLV_SIZE + len(value)
 
-        if protected_tlv_size != 0:
-            # Add the size of the TLV info header
-            protected_tlv_size += TLV_INFO_SIZE
-
         # At this point the image is already on the payload
         #
         # This adds the padding if image is not aligned to the 16 Bytes
         # in encrypted mode
-        if self.enckey is not None and dont_encrypt is False:
+        if ((self.enckey is not None) or (aes_gcm_key is not None)) and dont_encrypt is False:
             pad_len = len(self.payload) % 16
             if pad_len > 0:
                 pad = bytes(16 - pad_len)
@@ -558,6 +559,31 @@ class Image:
                     self.payload += pad
                 else:
                     self.payload.extend(pad)
+
+        # Initialize AES GCM IV and tag to None
+        aes_gcm_iv = None
+        aes_gcm_tag = None
+        if aes_gcm_key and dont_encrypt is False:
+            # generate 12-byte IV
+            aes_gcm_iv = os.urandom(12)
+            if aes_gcm_iv is not None:
+                protected_tlv_size += TLV_SIZE + len(aes_gcm_iv)
+            cipher = Cipher(algorithms.AES(aes_gcm_key), modes.GCM(aes_gcm_iv),
+                            backend=default_backend())
+            # encrypt img using aes gcm
+            encryptor = cipher.encryptor()
+            img = bytes(self.payload[self.header_size:])
+            print('the image size before encryption is', len(img))
+            encrypted_data = encryptor.update(img) + encryptor.finalize()
+            self.payload = bytearray(self.payload)  # Ensure self.payload is mutable
+            self.payload[self.header_size:] = encrypted_data
+            aes_gcm_tag = encryptor.tag
+            print('the tag is', aes_gcm_tag.hex())
+            protected_tlv_size += TLV_SIZE + len(aes_gcm_tag)
+
+        if protected_tlv_size != 0:
+            # Add the size of the TLV info header
+            protected_tlv_size += TLV_INFO_SIZE
 
         compression_flags = 0x0
         if compression_tlvs is not None:
@@ -567,9 +593,9 @@ class Image:
                     compression_flags |= IMAGE_F['COMPRESSED_ARM_THUMB']
         # This adds the header to the payload as well
         if encrypt_keylen == 256:
-            self.add_header(enckey, protected_tlv_size, compression_flags, 256)
+            self.add_header(enckey, protected_tlv_size, compression_flags, 256, aes_gcm_key=aes_gcm_key)
         else:
-            self.add_header(enckey, protected_tlv_size, compression_flags)
+            self.add_header(enckey, protected_tlv_size, compression_flags, aes_gcm_key=aes_gcm_key)
 
         prot_tlv = TLV(self.endian, TLV_PROT_INFO_MAGIC)
 
@@ -606,6 +632,14 @@ class Image:
             if custom_tlvs is not None:
                 for tag, value in custom_tlvs.items():
                     prot_tlv.add(tag, value)
+            if aes_gcm_iv is not None:
+                # Add the AES GCM IV to the protected TLV
+                print('the aes gcm iv is', aes_gcm_iv.hex())
+                prot_tlv.add('AESGCM_IV', aes_gcm_iv)
+            if aes_gcm_tag is not None:
+                # Add the AES GCM tag to the protected TLV
+                print('the aes gcm tag added to TLV is', aes_gcm_tag.hex())
+                prot_tlv.add('AESGCM_TAG', aes_gcm_tag)
 
             protected_tlv_off = len(self.payload)
 
@@ -621,6 +655,12 @@ class Image:
         sha.update(self.payload)
         digest = sha.digest()
         tlv.add(hash_tlv, digest)
+        if aes_gcm_key and aes_kw_key and dont_encrypt is False:
+            # wrap key using aes kw and add to TLV
+            wrapped_key = aes_key_wrap(aes_kw_key, aes_gcm_key)
+            print('the wrapped key is', wrapped_key.hex())
+            self.enctlv_len = len(wrapped_key)
+            tlv.add('ENCKW', wrapped_key)
         self.image_hash = digest
         # Unless pure, we are signing digest.
         message = digest
@@ -734,7 +774,7 @@ class Image:
     def get_infile_data(self):
         return self.infile_data
 
-    def add_header(self, enckey, protected_tlv_size, compression_flags, aes_length=128):
+    def add_header(self, enckey, protected_tlv_size, compression_flags, aes_length=128, aes_gcm_key=None):
         """Install the image header."""
 
         flags = 0
@@ -743,6 +783,9 @@ class Image:
                 flags |= IMAGE_F['ENCRYPTED_AES128']
             else:
                 flags |= IMAGE_F['ENCRYPTED_AES256']
+        elif aes_gcm_key is not None:
+            flags |= IMAGE_F['ENCRYPTED_AESGCM256']
+        
         if self.load_addr != 0:
             # Indicates that this image should be loaded into RAM
             # instead of run directly from flash.

@@ -365,6 +365,8 @@ class BasedIntParamType(click.ParamType):
 
 @click.argument('outfile')
 @click.argument('infile')
+@click.option('--aes-gcm-key', metavar='filename',help='AES GCM key to be used for image encryption')
+@click.option('--aes-kw-key', metavar='filename',help='AES KW key to be used for encrypting AES GCM key')
 @click.option('--non-bootable', default=False, is_flag=True,
               help='Mark the image as non-bootable.')
 @click.option('--custom-tlv', required=False, nargs=2, default=[],
@@ -479,7 +481,7 @@ def sign(key, public_key_format, align, version, pad_sig, header_size,
          dependencies, load_addr, hex_addr, erased_val, save_enctlv,
          security_counter, boot_record, custom_tlv, rom_fixed, max_align,
          clear, fix_sig, fix_sig_pubkey, sig_out, user_sha, hmac_sha, is_pure,
-         vector_to_sign, non_bootable):
+         vector_to_sign, non_bootable, aes_gcm_key=None, aes_kw_key=None):
 
     if confirm:
         # Confirmed but non-padded images don't make much sense, because
@@ -497,6 +499,21 @@ def sign(key, public_key_format, align, version, pad_sig, header_size,
     img.load(infile)
     key = load_key(key) if key else None
     enckey = load_key(encrypt) if encrypt else None
+
+    if not enckey:
+        if aes_gcm_key:
+            if not aes_kw_key:
+                raise click.UsageError("AES GCM key requires KW key, please pass aes_kw_key parameters too")
+
+            with open(aes_gcm_key, 'rb') as f:
+                aes_gcm_key = f.read()
+
+            with open(aes_kw_key, 'rb') as f:
+                aes_kw_key = f.read()
+    else:
+        if aes_gcm_key:
+            raise click.UsageError("Unsupported mode: --aes_gcm_key can not be used with public --encrypt mode")
+
     if enckey and key:
         if ((isinstance(key, keys.ECDSA256P1) and
              not isinstance(enckey, keys.ECDSA256P1Public))
@@ -606,7 +623,8 @@ def sign(key, public_key_format, align, version, pad_sig, header_size,
         img.create(key, public_key_format, enckey, dependencies, boot_record,
                custom_tlvs, compression_tlvs, None, int(encrypt_keylen), clear,
                baked_signature, pub_key, vector_to_sign, user_sha=user_sha,
-               hmac_sha=hmac_sha, is_pure=is_pure)
+               hmac_sha=hmac_sha, is_pure=is_pure, aes_gcm_key=aes_gcm_key,
+               aes_kw_key=aes_kw_key)
     img.save(outfile, hex_addr)
     if sig_out is not None:
         new_signature = img.get_signature()
